@@ -1,9 +1,11 @@
-using Prometheus;
-using System.Diagnostics;
-using OpenTelemetry.Resources;
+using OpenTelemetry.Metrics;
 using OpenTelemetry.Trace;
+using OpenTelemetry.Resources;
+using Oracle.ManagedDataAccess.OpenTelemetry;
 
 var builder = WebApplication.CreateBuilder(args);
+
+const string serviceName = "dice-roll-application";
 
 // Add services to the container.
 
@@ -12,24 +14,69 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// Documentation: https://opentelemetry.io/docs/instrumentation/net/getting-started/
-// This is a very bare bones instrumentation, but with this alone, traces will be capture and exported to the console and a configured OLTP collector.
-// By default, it will send the spans to localhost:4317, this can be changed based upon the configuration of your trace collector, such as the Grafana Agent. 
-// This will also identify http/grpc calls, as well as calls to SQL server, generating spans for those calls automatically. 
-// If the calling application is also instrumented for tracing, the trace will continue through that service, and any calls it makes
-
+// Instrument OpenTelemetry
 builder.Services.AddOpenTelemetry()
-    .WithTracing(tracerProviderBuilder =>
-        tracerProviderBuilder
-            .AddSource(DiagnosticsConfig.ActivitySource.Name)
-            .ConfigureResource(resource => resource
-                .AddService(DiagnosticsConfig.ServiceName))
-            .AddAspNetCoreInstrumentation()
-            .AddHttpClientInstrumentation()
-            .AddGrpcClientInstrumentation()
-            .AddSqlClientInstrumentation()
-            .AddConsoleExporter()
-            .AddOtlpExporter());
+    .ConfigureResource(resource => resource.AddService(serviceName))
+
+    //OpenTelemetry Metrics Auto-Instrumentation
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddConsoleExporter()  // Do not use in production. For local testing only. 
+        .AddPrometheusExporter()) // Exports Metrics in Prometheus format.
+
+    // OpenTelemetry Traces Auto-Instrumentation
+    .WithTracing(builder =>
+    {
+        builder.AddAspNetCoreInstrumentation(opts =>
+        {
+            opts.EnrichWithHttpRequest = (activity, httprequestmessage) =>
+            {
+                activity.DisplayName = httprequestmessage.PathBase;
+            };
+            
+        })
+        .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("GrafanaStackTelemetry"))
+        .AddSource("GrafanaStack.Traces")
+        .AddHttpClientInstrumentation(opts => // Trace calls to external HTTP resources. See more: https://github.com/open-telemetry/opentelemetry-dotnet/blob/main/src/OpenTelemetry.Instrumentation.Http/README.md
+        {
+            // Note: Only called on .NET & .NET Core runtimes.
+            opts.EnrichWithHttpRequestMessage = (activity, httpRequestMessage) =>
+            {
+                activity.SetTag("requestVersion", httpRequestMessage.Version);
+                activity.DisplayName = "Testing this functionality";
+            };
+            // Note: Only called on .NET & .NET Core runtimes.
+            opts.EnrichWithHttpResponseMessage = (activity, httpResponseMessage) =>
+            {
+                activity.SetTag("responseVersion", httpResponseMessage.Version);
+            };
+            // Note: Called for all runtimes
+            opts.EnrichWithException = (activity, exception) =>
+            {
+                activity.SetTag("stackTrace", exception.StackTrace);
+            };
+        })
+        // Trace calls to Oracle Databases
+        .AddOracleDataProviderInstrumentation(opts =>
+        {
+            opts.SetDbStatementForText = true; // Include DB Query Statement in span attributes
+            opts.SetDbStatementForStoredProcedure = true; // Include Called Stored Procedure in span attributes
+        })
+
+        // Trace calls to MS SQL Databases
+        .AddSqlClientInstrumentation(opts =>
+        {
+            opts.SetDbStatementForText = true; // enable writing sql query to span attribute
+            opts.SetDbStatementForStoredProcedure = true; // enable writing stored procedure name to span attribute
+        }) 
+
+        .AddConsoleExporter()  // Write Trace information to console (Do not use in Production)
+        .AddOtlpExporter(opts => //OTLP Exporter setup
+        {
+            opts.Endpoint = new Uri("http://localhost:4317");
+        });
+    });
+
 
 var app = builder.Build();
 
@@ -40,12 +87,8 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// Configuration for enabling a metrics endpoint and displaying base metrics. 
-// If generating custom metrics, the prometheus asp.net package will add exemplars to your metrics, allowing you to view traces from your metrics. 
-app.UseHttpMetrics();
-app.UseMetricServer();
-
-
+// Register and Configure Prometheus Scraping Middleware
+app.UseOpenTelemetryPrometheusScrapingEndpoint(); // Default path '/metrics'
 
 app.UseHttpsRedirection();
 
@@ -54,10 +97,3 @@ app.UseAuthorization();
 app.MapControllers();
 
 app.Run();
-
-
-public static class DiagnosticsConfig
-{
-    public const string ServiceName = "MyService";
-    public static ActivitySource ActivitySource = new ActivitySource(ServiceName);
-}
